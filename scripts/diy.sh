@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Graft the GL-MT5000 device support (OpenWrt PR #24237) onto official
-# openwrt-25.12, then convert the RTL8366UB (RTL8371C) switch from GL's
-# swconfig driver to a DSA driver ported to the kernel 6.12 API.
+# Graft GL.iNet's GL-MT5000 device support (OpenWrt PR #24237) onto official
+# openwrt main, then layer our RTL8371C driver fixes and the MediaTek PPE
+# hardware-flow-offload patch on top.
+#
+# As of GL's 2026-08-27 force-push, PR #24237 IS a DSA driver and ships the
+# full Realtek RTK SDK as GPL source, so there is no swconfig->DSA conversion
+# left to do here - we only replace rtl8366ub_dsa.c with our fixed version and
+# add the PPE patch. Everything else (DTS, PHY driver, board.d, image recipe,
+# kmod-dsa-tag-rtl8-4 split) comes from GL's commit unmodified.
+#
 # Run with CWD = OpenWrt source root.
 set -eu
 
@@ -9,58 +16,70 @@ WORKSPACE="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
 RTLPKG=package/kernel/rtl8366ub
 BOARDD=target/linux/mediatek/filogic/base-files/etc/board.d/02_network
 FILOGIC_MK=target/linux/mediatek/image/filogic.mk
-KCFG=target/linux/mediatek/filogic/config-6.12
+GENERIC_PATCHES=target/linux/generic/pending-6.18
+DTS=target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
 
-# --- 1. Graft the single GL device-support commit (PR #24237 head) ---------
-echo ">> Grafting GL-MT5000 device support (PR #24237) onto openwrt-25.12"
+# --- 1. Graft the GL device-support commit (PR #24237 head) ---------------
+echo ">> Grafting GL-MT5000 device support (PR #24237) onto openwrt main"
 git config user.email build@local
 git config user.name mt5000-build
 git remote add glinet "${GL_DEVICE_COMMIT:-https://github.com/GLiNet-Tech/openwrt.git}" 2>/dev/null || true
 # depth>=2 so cherry-pick has the commit's PARENT as a merge base; with depth 1
 # git lacks the base and treats the whole tree as add/add conflicts.
 git fetch --depth 3 glinet mt5000
-git cherry-pick -n FETCH_HEAD || { echo ">> ERROR: graft cherry-pick failed (openwrt-25.12 drift?)"; git cherry-pick --abort 2>/dev/null || true; exit 1; }
-test -f target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DTS missing after graft"; exit 1; }
+git cherry-pick -n FETCH_HEAD || {
+	echo ">> ERROR: graft cherry-pick failed (openwrt main drift?)"
+	git cherry-pick --abort 2>/dev/null || true
+	exit 1
+}
+test -f "$DTS" || { echo ">> ERROR: DTS missing after graft"; exit 1; }
 grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe missing after graft"; exit 1; }
 echo ">> graft OK"
 
-# --- 2. swconfig -> DSA ----------------------------------------------------
-echo ">> Converting RTL8366UB swconfig driver -> DSA (kernel 6.12 API)"
-
-# Ported DSA driver + build the DSA object instead of the swconfig one
+# --- 2. Our RTL8371C driver on top of GL's -------------------------------
+echo ">> Installing patched rtl8366ub_dsa.c"
 cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
-sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
-sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
 
-# Drop the swconfig package dependency (DSA core + tagger are in-kernel)
-sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
+# Our driver keeps a debugfs dir handle in priv; GL's header has no such field.
+if ! grep -q 'struct dentry \*dbgfs;' "$RTLPKG/src/rtl8366ub_dsa.h"; then
+	# perl, not sed -i: BSD/macOS sed rejects both bare -i and \n in the RHS,
+	# and this script is run by hand as often as it is run by CI.
+	perl -0pi -e 's|^( *)struct mutex reg_mutex;|$1struct dentry *dbgfs;\n\n$1struct mutex reg_mutex;|m' \
+		"$RTLPKG/src/rtl8366ub_dsa.h"
+fi
 
-# Scrub swconfig leftovers ONLY from the gl-mt5000 recipe (do NOT touch other
-# devices' recipes that legitimately use swconfig, e.g. mercusys_mr85x)
-sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
+# --- 3. MediaTek PPE hardware flow-offload for rtl8_4 --------------------
+# GL confirmed on their forum (thread 67297, #126) that HW acceleration is
+# "not fully compatible" on vanilla OpenWrt, shipped a fixed test build in
+# #130 that a tester confirmed working in #134, and said in #135 it would be
+# committed "once validation completes" - it is not in the repo yet. This is
+# our independently derived equivalent; drop it once GL publishes theirs.
+echo ">> Adding PPE rtl8_4 flow-offload patch"
+cp "$WORKSPACE/files/patches/795-10-mtk_ppe_offload-offload-flows-to-rtl8_4-switches.patch" \
+	"$GENERIC_PATCHES/"
 
-# DSA device tree (switch as an mdio child, per-port user netdevs + cpu@17)
-cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
-
-# GL's grafted board.d hunk inserts the gl-mt5000 case WITHOUT terminating the
-# preceding case (missing ';;') = shell syntax error. Repair the terminator AND
-# set the DSA default network (lan1/lan2 user ports, WAN on the SoC PHY eth1).
-perl -0pi -e 's/(ucidef_set_interfaces_lan_wan eth0 eth1\n)\s*glinet,gl-mt5000\)\s*\n.*?;;/$1\t\t;;\n\tglinet,gl-mt5000)\n\t\tucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"\n\t\t;;/s' "$BOARDD"
-
-# Enable the RTL8_4 DSA tagger in the kernel config
-grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
-
-# --- 3. Sanity gates (each can actually fail) ------------------------------
-grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
-  grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired (F7 fdb/learning/fast-age need rtksw_l2_*)"; exit 1; }
-grep -q "switch@0" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DSA DTS not applied"; exit 1; }
-grep -qF 'ucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"' "$BOARDD" || { echo ">> ERROR: gl-mt5000 DSA board.d line not injected"; exit 1; }
-grep -q 'glinet,gl-mt5000)' "$BOARDD" || { echo ">> ERROR: gl-mt5000 case missing from board.d"; exit 1; }
-if grep -q '17@eth0' "$BOARDD"; then echo ">> ERROR: stale swconfig ucidef_add_switch survived"; exit 1; fi
+# --- 4. Sanity gates (each can actually fail) ----------------------------
+grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" \
+	|| { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
+grep -q "rtl8366ub_phy.o" "$RTLPKG/src/Makefile" \
+	|| { echo ">> ERROR: PHY driver not wired in - 2.5G link + link state depend on it"; exit 1; }
+grep -q "ccflags-y += -I\$(src)" "$RTLPKG/src/Makefile" \
+	|| { echo ">> ERROR: -I\$(src) missing; chip.c will fail on <rtk_error.h>"; exit 1; }
+grep -q "phylink_mac_ops" "$RTLPKG/src/rtl8366ub_dsa.c" \
+	|| { echo ">> ERROR: our driver did not land (no phylink_mac_ops)"; exit 1; }
+grep -q "port_vlan_filtering" "$RTLPKG/src/rtl8366ub_dsa.c" \
+	|| { echo ">> ERROR: our driver did not land (no .port_vlan_filtering)"; exit 1; }
+grep -q 'struct dentry \*dbgfs;' "$RTLPKG/src/rtl8366ub_dsa.h" \
+	|| { echo ">> ERROR: dbgfs field not injected into priv struct"; exit 1; }
+grep -q "kmod-dsa-tag-rtl8-4" package/kernel/linux/modules/netdevices.mk \
+	|| { echo ">> ERROR: kmod-dsa-tag-rtl8-4 package missing"; exit 1; }
+grep -q "DSA_TAG_PROTO_RTL8_4" "$GENERIC_PATCHES/795-10-mtk_ppe_offload-offload-flows-to-rtl8_4-switches.patch" \
+	|| { echo ">> ERROR: PPE patch not installed"; exit 1; }
+grep -q 'glinet,gl-mt5000)' "$BOARDD" \
+	|| { echo ">> ERROR: gl-mt5000 case missing from board.d"; exit 1; }
 sh -n "$BOARDD" || { echo ">> ERROR: board.d/02_network has a shell syntax error"; exit 1; }
-if grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
 
-# --- 4. First-boot defaults ------------------------------------------------
+# --- 5. First-boot defaults ----------------------------------------------
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-gl-mt5000 <<'UCI'
 #!/bin/sh
@@ -73,6 +92,4 @@ EOF
 exit 0
 UCI
 
-echo ">> DSA conversion applied"
-
-
+echo ">> diy.sh complete"

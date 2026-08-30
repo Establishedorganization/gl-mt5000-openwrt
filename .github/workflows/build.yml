@@ -1,11 +1,14 @@
-name: Build GL-MT5000 OpenWrt (DSA)
+
+          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config \
+            || { echo "ERROR: rtl8_4 tagger not selected"; exit 1; }
+          echo "kmod-dsa-tag-rtl8-4: selected"name: Build GL-MT5000 OpenWrt (DSA)
 
 on:
   workflow_dispatch:
 
 env:
   REPO_URL: https://github.com/openwrt/openwrt
-  REPO_BRANCH: openwrt-25.12
+  REPO_BRANCH: main
   GL_DEVICE_COMMIT: https://github.com/GLiNet-Tech/openwrt.git
   OPENWRT_PATH: /mnt/openwrt
   TZ: Europe/Lisbon
@@ -31,7 +34,7 @@ jobs:
             python3 python3-setuptools rsync swig unzip zlib1g-dev file wget \
             libelf-dev ccache qemu-utils
 
-      - name: Clone OpenWrt (official, openwrt-25.12)
+      - name: Clone OpenWrt (official, main)
         run: |
           sudo mkdir -p "$OPENWRT_PATH"
           sudo chown "$USER:$USER" "$OPENWRT_PATH"
@@ -45,7 +48,7 @@ jobs:
           path: |
             /mnt/openwrt/dl
             /mnt/openwrt/.ccache
-          key: mt5000-${{ hashFiles('config/mt5000.config', 'scripts/diy.sh', 'files/dsa/rtl8366ub_dsa.c') }}
+          key: mt5000-${{ hashFiles('config/mt5000.config', 'scripts/diy.sh', 'files/dsa/rtl8366ub_dsa.c', 'files/patches/795-10-mtk_ppe_offload-offload-flows-to-rtl8_4-switches.patch') }}
           restore-keys: mt5000-
 
       - name: Graft device support + convert switch to DSA
@@ -71,6 +74,9 @@ jobs:
           grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config \
             || { echo "ERROR: kmod-rtl8366ub was dropped by defconfig"; exit 1; }
           echo "kmod-rtl8366ub: selected"
+          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config \
+            || { echo "ERROR: rtl8_4 DSA tagger not selected"; exit 1; }
+          echo "kmod-dsa-tag-rtl8-4: selected"
 
       - name: Download sources
         run: |

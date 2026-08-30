@@ -1,0 +1,74 @@
+From: Diogo Pascoal <diogo.pascoal@procimo.com>
+Subject: [PATCH] net: ethernet: mtk_ppe_offload: allow offload to Realtek rtl8_4 switches
+
+mtk_flow_get_dsa_port() only substitutes *dev with the DSA conduit for tag
+protocols the PPE can generate a tag for. Every other protocol takes the
+default case, which returns while *dev is still the DSA user netdev.
+
+mtk_flow_set_output_device() then fails its
+
+	if (dev == eth->netdev[0]) ... else return -EOPNOTSUPP;
+
+check, because a user netdev is none of the GDM netdevs. So a flow whose
+egress is a DSA user port on a non-MediaTek switch is refused outright.
+
+On the GL.iNet GL-MT5000 (Brume 3) the LAN ports sit behind a Realtek
+RTL8371C using DSA_TAG_PROTO_RTL8_4, while the WAN is the SoC's own PHY on
+eth1. LAN->WAN egresses on eth1 and offloads fine; WAN->LAN egresses on
+lan1/lan2 and is refused. A flowtable entry needs both directions, so
+hardware offload degrades to the software path: ~2.25 Gbit/s with one CPU
+core pinned at 100%, versus 2.37 Gbit/s at near-idle on the vendor firmware.
+
+The PPE cannot synthesise the Realtek proprietary 0x8899 CPU tag, so there
+is no port-directed offload available here. But port-directed delivery is
+not required: rtk_cpu_tagPort_set() programs CPU_TAG_AWARE_CTRL, and the
+switch parses an inbound CPU tag only when the 0x8899 Length/Type is
+actually present. An untagged frame injected by the PPE on the conduit
+therefore takes the switch's ordinary FDB path and is delivered correctly.
+
+Add a case that substitutes the conduit and then returns -ENODEV, so the
+caller resolves a real GDM pse_port, skips mtk_foe_entry_set_dsa() and the
+DSA queue map, and falls back to queue = pse_port - 1.
+
+This also fixes ingress ppe_index selection for flows coming *from* a
+Realtek user port, since mtk_flow_offload_replace() calls
+mtk_flow_get_dsa_port(&idev, NULL) purely for the conduit substitution.
+
+Note for VLAN setups: an untagged injected frame takes the CPU port's PVID.
+Flows egressing a VLAN upper (e.g. br-lan.20) still carry their user VLAN
+push, so they land in the right VLAN; flows on the untagged default VLAN
+are unaffected. A tagged trunk with no user VLAN push is the case to watch.
+
+Signed-off-by: Diogo Pascoal <diogo.pascoal@procimo.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -203,6 +203,28 @@
+ 		if (push_vid)
+ 			*push_vid = dsa_tag_8021q_standalone_vid(dp);
+ 		break;
++	case DSA_TAG_PROTO_RTL8_4:
++		/*
++		 * The Realtek 0x8899 CPU tag has no representation in a PPE
++		 * foe entry: the PPE can push an 802.1Q header but cannot
++		 * synthesise a proprietary tag, so no port-directed offload
++		 * is possible.  Still substitute the conduit, then report
++		 * "not a taggable DSA port" so the caller skips both
++		 * mtk_foe_entry_set_dsa() and the DSA queue map.  The frame
++		 * leaves the CPU port untagged and the switch delivers it by
++		 * ordinary FDB lookup - the RTL8371C parses an inbound CPU
++		 * tag only when the 0x8899 Length/Type is actually present.
++		 *
++		 * Without this, the default case returned while *dev was
++		 * still the DSA user netdev, which matches none of
++		 * eth->netdev[] in mtk_flow_set_output_device(), so that
++		 * function returned -EOPNOTSUPP and the WAN->LAN half of
++		 * every flow was refused.  A flowtable entry needs both
++		 * directions, so hardware offload silently degraded to the
++		 * software path on GL.iNet MT5000 (RTL8371C) boards.
++		 */
++		*dev = dsa_port_to_conduit(dp);
++		return -ENODEV;
+ 	default:
+ 		return -ENODEV;
+ 	}

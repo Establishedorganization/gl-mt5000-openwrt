@@ -1,39 +1,72 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * This is a sparsely documented chip, the only viable documentation seems
- * to be a patched up code drop from the vendor that appear in various
- * GPL source trees.
+ * DSA driver for the Realtek RTL8371C ("RTL8366UB") 2.5G switch as fitted to
+ * the GL.iNet GL-MT5000 (Brume 3).
  *
  * Copyright (C) 2024 Jianhui Zhao <jianhui.zhao@gl-inet.com>
  *
- * Ported from the kernel 5.4 DSA API to 6.12 (phylink_get_caps, per-vid
- * port_vlan_add/del with extack, struct dsa_bridge, modern dsa_switch
- * allocation, of_get_phy_mode by-reference). VLAN membership is now
- * read-modify-write so bridged multi-port VLANs keep all members.
+ * Based on GL.iNet's DSA driver from OpenWrt PR #24237 (GLiNet-Tech/openwrt
+ * commit d174ae5, force-pushed 2026-08-27, kernel 6.18). That version is
+ * bench-validated - LAN1<->LAN2 and VLAN trunking both confirmed working on
+ * real hardware - so it is the reference, and the changes below are layered
+ * on top of it rather than the other way round:
+ *
+ *   1. PHY power up/down goes through the OCP accessor. GL reaches OCP
+ *      register 0xa610 with rtk_port_phyReg_set(), the Clause-22 accessor,
+ *      which rejects any reg > RTL8371C_PHY_REGNOMAX (31) with
+ *      RT_ERR_PHY_REG_ID - so both its power-up and power-down writes are
+ *      silently dropped. This uses the same read-modify-write on bit 11 that
+ *      dal_rtl8371c_port_phyEnableAll_set() performs.
+ *
+ *   2. Spanning-tree state is written to MSTI 0, the instance every VLAN
+ *      entry actually references (fid_msti = 0). GL writes MSTI 1, which no
+ *      VLAN references, making .port_stp_state_set a hardware no-op.
+ *      NOTE: this is the highest-risk change here - it takes a call that
+ *      currently does nothing and makes it program real forwarding state.
+ *      Revert this one first if ports come up blocked.
+ *
+ *   3. rtk_vlan_init() enables per-port ingress VLAN filtering on every valid
+ *      port. DSA expects a switch that is transparent to VLAN tags until a
+ *      bridge asks otherwise, so setup() clears it (including on the CPU
+ *      trunk port, which DSA never toggles) and .port_vlan_filtering turns it
+ *      back on per port. Without this a vlan_filtering=0 bridge silently
+ *      drops any tagged frame whose VID the bridge never added.
+ *
+ *   4. .port_vlan_add / .port_vlan_del fail closed: a failed read of the
+ *      current entry never falls back to a zeroed one, which would erase
+ *      every other member port of that VID.
+ *
+ *   5. .port_fdb_add / .port_fdb_del plus assisted_learning_on_cpu_port: the
+ *      rtl8_4 tagger sets LEARN_DIS on every CPU-injected frame, so without
+ *      this the switch never learns the router's own MAC and floods replies.
+ *
+ *   6. .port_fast_age, .port_pre_bridge_flags / .port_bridge_flags (hardware
+ *      learning toggle) and .port_change_mtu / .port_max_mtu, which must
+ *      account for the 8-byte rtl8_4 tag on the CPU port.
+ *
+ *   7. .shutdown, and a small debugfs corner for bring-up.
  */
 
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/debugfs.h>
-#include <linux/of_mdio.h>
+#include <linux/mii.h>
 #include <linux/of_net.h>
 #include <linux/bitops.h>
-#include <linux/regmap.h>
 #include <linux/phylink.h>
 #include <net/dsa.h>
 #include <net/switchdev.h>
 #include <linux/gpio/consumer.h>
 
 #include "rtk_switch.h"
+#include "rtk_error.h"
 #include "port.h"
 #include "vlan.h"
 #include "cpu.h"
 #include "l2.h"
 #include "rtl8366ub_dsa.h"
 #include "dal/smi.h"
-
-extern void rtk_set_mdc_mdio(struct mii_bus *bus, int id);
 
 /* Length of the Realtek rtl8_4 CPU tag inserted on the CPU/extension port
  * (see net/dsa/tag_rtl8_4.c, RTL8_4_TAG_LEN).
@@ -46,12 +79,46 @@ extern void rtk_set_mdc_mdio(struct mii_bus *bus, int id);
  */
 #define RTL8366UB_MAX_PKT_LEN	0x3FEF
 
+/* OCP register holding the per-PHY power-down bit on the 2.5G-capable UTP
+ * ports (bit 11), per dal_rtl8371c_port_phyEnableAll_set().
+ */
+#define RTL8366UB_PHY_OCP_PWR	0xa610
+#define RTL8366UB_PHY_OCP_PDOWN	0x0800
+
+static int rtl8366ub_sdk_errno(rtksw_api_ret_t ret)
+{
+    switch (ret) {
+    case RT_ERR_OK:
+        return 0;
+    case RT_ERR_INPUT:
+    case RT_ERR_UNIT_ID:
+    case RT_ERR_PORT_ID:
+    case RT_ERR_PORT_MASK:
+    case RT_ERR_NULL_POINTER:
+    case RT_ERR_OUT_OF_RANGE:
+        return -EINVAL;
+    case RT_ERR_BUSYWAIT_TIMEOUT:
+        return -ETIMEDOUT;
+    case RT_ERR_NOT_INIT:
+    case RT_ERR_CHIP_NOT_FOUND:
+        return -ENODEV;
+    case RT_ERR_CHIP_NOT_SUPPORTED:
+    case RT_ERR_DRIVER_NOT_FOUND:
+        return -EOPNOTSUPP;
+    default:
+        return -EIO;
+    }
+}
+
+static int rtl8366ub_sdk_read(struct rtl8366ub_priv *priv, u32 reg, u32 *val)
+{
+    return rtl8366ub_sdk_errno(reg_smi_read(0, reg, val));
+}
+
 static int rtl8366ub_find_cpu_port(struct dsa_switch *ds)
 {
-    /* Find the connected cpu port. Valid ext ports are EXT_PORT0 (16) or
-     * EXT_PORT1 (17); the MT5000 wires the 2500base-x/HSGMII CPU link on
-     * EXT_PORT1.
-     */
+    /* Find the connected cpu port. Valid port are 3 or 8 */
+
     if (dsa_is_cpu_port(ds, EXT_PORT0))
         return EXT_PORT0;
 
@@ -69,17 +136,61 @@ static enum dsa_tag_protocol rtl8366ub_sw_get_tag_protocol(struct dsa_switch *ds
     if (port != EXT_PORT0 && port != EXT_PORT1) {
         dev_warn(priv->dev, "port not matched with tagging CPU port\n");
         return DSA_TAG_PROTO_NONE;
+    } else {
+        return DSA_TAG_PROTO_RTL8_4;
+    }
+}
+
+/*
+ * Power a single user-port PHY up or down.
+ *
+ * GL's driver writes 0x2058 / 0x2858 to 0xa610 through rtk_port_phyReg_set(),
+ * but dal_rtl8371c_port_phyReg_set() range-checks reg against
+ * RTL8371C_PHY_REGNOMAX (31) and returns RT_ERR_PHY_REG_ID, so those writes
+ * never reach the chip. The DAL's own phyEnableAll_set() reaches 0xa610 via
+ * the OCP accessor and flips bit 11 read-modify-write; mirror that, and fall
+ * back to the plain C22 BMCR power-down bit on non-2.5G ports exactly as the
+ * DAL does.
+ */
+static int rtl8366ub_phy_power(int port, bool on)
+{
+    rtksw_port_phy_data_t data;
+    rtksw_api_ret_t ret;
+
+    if (rtksw_switch_isUtp2p5gPort(0, port) == RT_ERR_OK) {
+        ret = rtk_port_phyOCPReg_get(port, RTL8366UB_PHY_OCP_PWR, &data);
+        if (ret != RT_ERR_OK)
+            return rtl8366ub_sdk_errno(ret);
+
+        if (on)
+            data &= ~(u32)RTL8366UB_PHY_OCP_PDOWN;
+        else
+            data |= RTL8366UB_PHY_OCP_PDOWN;
+
+        ret = rtk_port_phyOCPReg_set(port, RTL8366UB_PHY_OCP_PWR, data);
+    } else {
+        ret = rtk_port_phyReg_get(port, MII_BMCR, &data);
+        if (ret != RT_ERR_OK)
+            return rtl8366ub_sdk_errno(ret);
+
+        if (on)
+            data &= ~(u32)BMCR_PDOWN;
+        else
+            data |= BMCR_PDOWN;
+
+        ret = rtk_port_phyReg_set(port, MII_BMCR, data);
     }
 
-    return DSA_TAG_PROTO_RTL8_4;
+    return rtl8366ub_sdk_errno(ret);
 }
 
 static int rtl8366ub_cpu_mac_config(struct dsa_switch *ds, rtksw_port_t port,
                                     phy_interface_t phy_mode)
 {
     struct rtl8366ub_priv *priv = ds->priv;
-    rtksw_port_mac_ability_t mac_cfg;
+    rtksw_port_mac_ability_t mac_cfg = { 0 };
     rtksw_mode_ext_t mode_ext;
+    int ret;
 
     mode_ext = RTKSW_MODE_EXT_HSGMII;
     mac_cfg.forcemode = PORT_MAC_FORCE;
@@ -101,9 +212,18 @@ static int rtl8366ub_cpu_mac_config(struct dsa_switch *ds, rtksw_port_t port,
             mode_ext = RTKSW_MODE_EXT_USXGMII;
             break;
         default:
-            dev_err(priv->dev, "phy mode %d not supported for CPU port\n", phy_mode);
+            dev_err(priv->dev, "phy mode %s not supported for CPU port\n",
+                    phy_modes(phy_mode));
+            return -EOPNOTSUPP;
     }
-    rtk_port_macForceLinkExt_set(port, mode_ext, &mac_cfg);
+
+    ret = rtk_port_macForceLinkExt_set(port, mode_ext, &mac_cfg);
+    if (ret != RT_ERR_OK) {
+        dev_err(priv->dev, "failed to configure CPU port %u: %d\n",
+                port, ret);
+        return -EIO;
+    }
+
     return 0;
 }
 
@@ -112,19 +232,20 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
     struct rtl8366ub_priv *priv = ds->priv;
     rtksw_portmask_t portmask;
     rtksw_portmask_t cpu_portmask;
-    struct dsa_port *cpu_dp;
-    phy_interface_t interface;
+    phy_interface_t phy_mode;
     int ret, i;
     u32 val;
 
-    /* Reset whole chip through gpio pin */
+    /* Reset whole chip through gpio pin or memory-mapped registers for
+     * different type of hardware
+     */
     gpiod_set_value_cansleep(priv->reset, 0);
     usleep_range(100000, 150000);
     gpiod_set_value_cansleep(priv->reset, 1);
     usleep_range(1000000, 1500000);
 
     /* Detect device */
-    ret = reg_mdcmdio_read(0x4, &val);
+    ret = rtl8366ub_sdk_read(priv, 0x4, &val);
     if (ret) {
         dev_err(priv->dev, "can't get chip ID (%d)\n", ret);
         return ret;
@@ -142,26 +263,25 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
 
     priv->cpu_port = rtl8366ub_find_cpu_port(ds);
     if (priv->cpu_port < 0) {
-        dev_err(priv->dev, "No cpu port configured in both ext port %d and %d\n",
-                EXT_PORT0, EXT_PORT1);
+        dev_err(priv->dev, "No cpu port configured in both cpu port3 and port8");
         return -EINVAL;
     }
 
-    cpu_dp = dsa_to_port(ds, priv->cpu_port);
-    ret = of_get_phy_mode(cpu_dp->dn, &interface);
+    ret = of_get_phy_mode(dsa_to_port(ds, priv->cpu_port)->dn, &phy_mode);
     if (ret) {
-        dev_err(priv->dev, "Can't find phy-mode for cpu port\n");
-        return -ENODEV;
+        dev_err(priv->dev, "can't get phy-mode for CPU port: %d\n", ret);
+        return ret;
     }
 
-    if (rtk_switch_init() != RT_ERR_OK) {
-        dev_err(priv->dev, "rtk_switch_init failed\n");
-        return -EIO;
-    }
-    if (rtk_vlan_init() != RT_ERR_OK) {
-        dev_err(priv->dev, "rtk_vlan_init failed\n");
-        return -EIO;
-    }
+    ret = rtk_switch_init();
+    if (ret != RT_ERR_OK)
+        return dev_err_probe(priv->dev, -EIO,
+                             "failed to initialize switch: %d\n", ret);
+
+    ret = rtk_vlan_init();
+    if (ret != RT_ERR_OK)
+        return dev_err_probe(priv->dev, -EIO,
+                             "failed to initialize VLANs: %d\n", ret);
 
     RTKSW_PORTMASK_CLEAR(portmask);
     for (i = 0; i < RTL8366UB_NUM_PORTS; i++) {
@@ -173,10 +293,10 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
 
         /*
          * rtk_vlan_init() turns on per-port ingress VLAN filtering, which
-         * would drop tagged frames whose VID has no 4k-table membership.
-         * DSA expects a non-filtering switch by default (transparent to
-         * VLAN tags); .port_vlan_filtering re-enables it per port when a
-         * bridge requests vlan_filtering=1.
+         * drops tagged frames whose VID has no 4k-table membership. DSA
+         * expects a non-filtering switch by default (transparent to VLAN
+         * tags); .port_vlan_filtering re-enables it per port when a bridge
+         * requests vlan_filtering=1.
          */
         rtk_vlan_portIgrFilterEnable_set(i, RTKSW_DISABLED);
     }
@@ -184,39 +304,59 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
     rtk_port_isolation_set(priv->cpu_port, &portmask);
 
     /* rtk_vlan_init() turns ingress VLAN filtering on for ALL valid ports,
-     * including the CPU/extension port. The setup loop above only clears it
-     * for the user ports (0..RTL8366UB_NUM_PORTS-1), and DSA only ever
-     * toggles .port_vlan_filtering on user ports - so the CPU port would stay
-     * filtered forever. The CPU port is a trunk that must accept every bridge
-     * VLAN (and CPU-injected frames); leave its ingress filter off. Egress is
-     * still governed by the per-VID member set programmed in port_vlan_add.
+     * including the CPU/extension port. The loop above only clears it for the
+     * user ports, and DSA only ever toggles .port_vlan_filtering on user
+     * ports - so the CPU port would stay filtered forever. The CPU port is a
+     * trunk that must accept every bridge VLAN (and CPU-injected frames);
+     * leave its ingress filter off. Egress is still governed by the per-VID
+     * member set programmed in .port_vlan_add.
      */
     rtk_vlan_portIgrFilterEnable_set(priv->cpu_port, RTKSW_DISABLED);
 
-    rtl8366ub_cpu_mac_config(ds, priv->cpu_port, interface);
-    rtk_cpu_tagPort_set(priv->cpu_port, CPU_INSERT_TO_ALL);
-    rtk_cpu_enable_set(RTKSW_ENABLED);
+    ret = rtl8366ub_cpu_mac_config(ds, priv->cpu_port, phy_mode);
+    if (ret)
+        return ret;
 
-    rtk_port_phyEnableAll_set(RTKSW_ENABLED);
+    /* Also writes CPU_TAG_AWARE_CTRL = BIT(phys cpu port), i.e. makes the CPU
+     * port parse an inbound 0x8899 tag when one is present. Frames arriving
+     * from the CPU without that Length/Type - such as anything the MediaTek
+     * PPE emits on the conduit - simply take the normal FDB path.
+     */
+    ret = rtk_cpu_tagPort_set(priv->cpu_port, CPU_INSERT_TO_ALL);
+    if (ret != RT_ERR_OK)
+        return dev_err_probe(priv->dev, -EIO,
+                             "failed to configure CPU tag port: %d\n", ret);
+
+    ret = rtk_cpu_enable_set(RTKSW_ENABLED);
+    if (ret != RT_ERR_OK)
+        return dev_err_probe(priv->dev, -EIO,
+                             "failed to enable CPU tagging: %d\n", ret);
+
+    ret = rtk_port_phyEnableAll_set(RTKSW_ENABLED);
+    if (ret != RT_ERR_OK)
+        return dev_err_probe(priv->dev, -EIO,
+                             "failed to enable PHYs: %d\n", ret);
+
     return 0;
 }
 
 static int rtl8366ub_sw_phy_read(struct dsa_switch *ds, int port, int regnum)
 {
-    unsigned int val;
+    rtksw_port_phy_data_t val;
+    int ret;
 
-    /* Return the MDIO "no device" value on error rather than leaking stack
-     * garbage onto the DSA user MII bus (would hallucinate PHY IDs on scan).
-     */
-    if (rtk_port_phyReg_get(port, regnum, &val) != RT_ERR_OK)
-        return 0xffff;
-    return val & 0xffff;
+    ret = rtk_port_phyReg_get(port, regnum, &val);
+    if (ret != RT_ERR_OK)
+        return -EIO;
+
+    return val;
 }
 
 static int rtl8366ub_sw_phy_write(struct dsa_switch *ds, int port, int regnum, u16 val)
 {
     if (rtk_port_phyReg_set(port, regnum, val) != RT_ERR_OK)
         return -EIO;
+
     return 0;
 }
 
@@ -224,37 +364,17 @@ static int rtl8366ub_sw_port_enable(struct dsa_switch *ds, int port,
                                     struct phy_device *phy)
 {
     struct rtl8366ub_priv *priv = ds->priv;
-    rtksw_port_phy_ability_t ability;
+    int ret;
 
     if (!dsa_is_user_port(ds, port))
         return 0;
 
     mutex_lock(&priv->reg_mutex);
     priv->ports[port].enable = true;
-
-    /* Power the PHY up. 0xa610 is an OCP register, so it must go through the
-     * OCP accessor; the Clause-22 rtk_port_phyReg_set rejects reg > 0x1f.
-     */
-    rtk_port_phyOCPReg_set(port, 0xa610, 0x2058);
-
-    /* The integrated PHYs are 2.5G capable, but generic C22 phylib can only
-     * advertise up to 1000BASE-T. Program the full ability (incl. 2.5G)
-     * through the SDK so the port can actually negotiate 2.5G.
-     */
-    memset(&ability, 0, sizeof(ability));
-    ability.AutoNegotiation = 1;
-    ability.Half_10 = 1;
-    ability.Full_10 = 1;
-    ability.Half_100 = 1;
-    ability.Full_100 = 1;
-    ability.Full_1000 = 1;
-    ability.Full_2P5G = 1;
-    ability.FC = 1;
-    ability.AsyFC = 1;
-    rtk_port_phyAutoNegoAbility_set(port, &ability);
-
+    ret = rtl8366ub_phy_power(port, true);
     mutex_unlock(&priv->reg_mutex);
-    return 0;
+
+    return ret;
 }
 
 static void rtl8366ub_sw_port_disable(struct dsa_switch *ds, int port)
@@ -266,8 +386,7 @@ static void rtl8366ub_sw_port_disable(struct dsa_switch *ds, int port)
 
     mutex_lock(&priv->reg_mutex);
     priv->ports[port].enable = false;
-    /* Power the PHY down via the OCP accessor (0xa610, power-down bit set). */
-    rtk_port_phyOCPReg_set(port, 0xa610, 0x2858);
+    rtl8366ub_phy_power(port, false);
     mutex_unlock(&priv->reg_mutex);
 }
 
@@ -296,9 +415,9 @@ static void rtl8366ub_sw_stp_state_set(struct dsa_switch *ds, int port, u8 state
     }
 
     /* All VLAN entries carry fid_msti=0, so the spanning-tree state must be
-     * written to MSTI 0 — the instance that actually governs their traffic.
-     * (The original wrote MSTI 1, an instance no VLAN references, making STP
-     * a hardware no-op.)
+     * written to MSTI 0 - the instance that actually governs their traffic.
+     * GL writes MSTI 1, an instance no VLAN references, making this a
+     * hardware no-op.
      */
     rtk_stp_mstpState_set(0, port, stp_state);
 }
@@ -313,13 +432,12 @@ static int rtl8366ub_sw_port_bridge_join(struct dsa_switch *ds, int port,
     rtksw_portmask_t portmask;
     int i;
 
-    /* The isolation update is a read-modify-write spanning several SDK
-     * calls (rtk_port_isolation_get + _set). Hold reg_mutex so it cannot
-     * interleave with another port's join/leave or a vlan_add/del RMW,
-     * matching the locking already used in port_vlan_add/del. (rtnl_lock
-     * serializes these switchdev ops today, so this is robustness /
-     * consistency rather than an active race, but the SDK-level lock only
-     * makes each individual get/set atomic, not the get..set pair.)
+    /* The isolation update is a read-modify-write spanning several SDK calls
+     * (rtk_port_isolation_get + _set). Hold reg_mutex so it cannot interleave
+     * with another port's join/leave or a vlan_add/del RMW. rtnl_lock
+     * serialises these switchdev ops today, so this is consistency rather
+     * than an active race, but the SDK-level lock only makes each individual
+     * get/set atomic, not the get..set pair.
      */
     mutex_lock(&priv->reg_mutex);
 
@@ -381,6 +499,24 @@ static void rtl8366ub_sw_port_bridge_leave(struct dsa_switch *ds, int port,
     mutex_unlock(&priv->reg_mutex);
 }
 
+static int rtl8366ub_sw_port_vlan_filtering(struct dsa_switch *ds, int port,
+                                            bool vlan_filtering,
+                                            struct netlink_ext_ack *extack)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+
+    /* Per-port ingress VLAN filtering: only enforce membership when the
+     * bridge actually asks for vlan_filtering=1. setup() leaves it off so a
+     * plain (non-filtering) bridge is transparent to tags.
+     */
+    mutex_lock(&priv->reg_mutex);
+    rtk_vlan_portIgrFilterEnable_set(port,
+        vlan_filtering ? RTKSW_ENABLED : RTKSW_DISABLED);
+    mutex_unlock(&priv->reg_mutex);
+
+    return 0;
+}
+
 static int rtl8366ub_sw_port_vlan_add(struct dsa_switch *ds, int port,
                                       const struct switchdev_obj_port_vlan *vlan,
                                       struct netlink_ext_ack *extack)
@@ -393,10 +529,10 @@ static int rtl8366ub_sw_port_vlan_add(struct dsa_switch *ds, int port,
 
     mutex_lock(&priv->reg_mutex);
 
-    /* Read-modify-write: keep the existing members of this VLAN so that a
-     * bridge spanning several ports does not lose members as each port is
-     * added one at a time. A read failure must NOT fall back to a zeroed
-     * entry — writing that back would erase every other member of the VID.
+    /* Read-modify-write: keep the existing members of this VLAN so a bridge
+     * spanning several ports does not lose members as each port is added one
+     * at a time. A read failure must NOT fall back to a zeroed entry - writing
+     * that back would erase every other member of the VID.
      */
     if (rtk_vlan_get(vid, &vlan_entry) != RT_ERR_OK) {
         mutex_unlock(&priv->reg_mutex);
@@ -420,6 +556,7 @@ static int rtl8366ub_sw_port_vlan_add(struct dsa_switch *ds, int port,
     }
 
     mutex_unlock(&priv->reg_mutex);
+
     return 0;
 }
 
@@ -453,83 +590,7 @@ static int rtl8366ub_sw_port_vlan_del(struct dsa_switch *ds, int port,
     }
 
     mutex_unlock(&priv->reg_mutex);
-    return 0;
-}
 
-static void rtl8366ub_sw_phylink_get_caps(struct dsa_switch *ds, int port,
-                                          struct phylink_config *config)
-{
-    config->mac_capabilities = MAC_SYM_PAUSE | MAC_ASYM_PAUSE |
-                               MAC_10 | MAC_100 | MAC_1000FD;
-
-    if (port == EXT_PORT0 || port == EXT_PORT1) {
-        /* CPU / extension port: 2.5G HSGMII (or 10G USXGMII) SerDes link. */
-        config->mac_capabilities |= MAC_2500FD | MAC_5000FD | MAC_10000FD;
-        __set_bit(PHY_INTERFACE_MODE_2500BASEX, config->supported_interfaces);
-        __set_bit(PHY_INTERFACE_MODE_USXGMII, config->supported_interfaces);
-        __set_bit(PHY_INTERFACE_MODE_10GKR, config->supported_interfaces);
-    } else {
-        /* User ports use the integrated copper PHYs, up to 2.5G. */
-        config->mac_capabilities |= MAC_2500FD;
-        __set_bit(PHY_INTERFACE_MODE_INTERNAL, config->supported_interfaces);
-        __set_bit(PHY_INTERFACE_MODE_GMII, config->supported_interfaces);
-    }
-}
-
-static void rtl8366ub_sw_phylink_mac_config(struct dsa_switch *ds, int port,
-                                            unsigned int mode,
-                                            const struct phylink_link_state *state)
-{
-    struct rtl8366ub_priv *priv = ds->priv;
-
-    /* The CPU/extension port is force-configured in setup(); user ports use
-     * their integrated PHYs driven by phylib, with the MAC forced from
-     * mac_link_up(). Nothing to do here for either conventional PHY or
-     * fixed-link modes.
-     */
-    if (mode != MLO_AN_PHY && mode != MLO_AN_FIXED)
-        dev_err(priv->dev,
-                "port %d supports only conventional PHY or fixed-link\n", port);
-}
-
-static void rtl8366ub_sw_phylink_mac_link_down(struct dsa_switch *ds, int port,
-                                               unsigned int mode,
-                                               phy_interface_t interface)
-{
-    rtksw_port_mac_ability_t mac_cfg;
-
-    if (port >= RTL8366UB_NUM_PORTS)
-        return;
-
-    /* Fully initialize: the DAL range-checks every field, so leaving 6 of 7
-     * fields as stack garbage makes the force-link-down write get rejected
-     * (or, worse, writes random speed/duplex/pause into the MAC register).
-     */
-    memset(&mac_cfg, 0, sizeof(mac_cfg));
-    mac_cfg.forcemode = PORT_MAC_FORCE;
-    mac_cfg.speed = RTKSW_PORT_SPEED_1000M;
-    mac_cfg.duplex = RTKSW_PORT_FULL_DUPLEX;
-    mac_cfg.link = RTKSW_PORT_LINKDOWN;
-    mac_cfg.nway = RTKSW_DISABLED;
-    mac_cfg.txpause = RTKSW_DISABLED;
-    mac_cfg.rxpause = RTKSW_DISABLED;
-    rtk_port_macForceLink_set(port, &mac_cfg);
-}
-
-static int rtl8366ub_sw_port_vlan_filtering(struct dsa_switch *ds, int port,
-                                            bool vlan_filtering,
-                                            struct netlink_ext_ack *extack)
-{
-    struct rtl8366ub_priv *priv = ds->priv;
-
-    /* Per-port ingress VLAN filtering: only enforce membership when the
-     * bridge actually asks for vlan_filtering=1. setup() leaves it off so a
-     * plain (non-filtering) bridge is transparent to tags.
-     */
-    mutex_lock(&priv->reg_mutex);
-    rtk_vlan_portIgrFilterEnable_set(port,
-        vlan_filtering ? RTKSW_ENABLED : RTKSW_DISABLED);
-    mutex_unlock(&priv->reg_mutex);
     return 0;
 }
 
@@ -648,65 +709,6 @@ static int rtl8366ub_sw_port_fdb_del(struct dsa_switch *ds, int port,
     return -EIO;
 }
 
-static void rtl8366ub_sw_phylink_mac_link_up(struct dsa_switch *ds, int port,
-                                             unsigned int mode,
-                                             phy_interface_t interface,
-                                             struct phy_device *phydev,
-                                             int speed, int duplex,
-                                             bool tx_pause, bool rx_pause)
-{
-    struct rtl8366ub_priv *priv = ds->priv;
-    rtksw_port_mac_ability_t mac_cfg;
-    rtksw_port_linkStatus_t link = RTKSW_PORT_LINKDOWN;
-    rtksw_port_speed_t phy_speed = RTKSW_PORT_SPEED_1000M;
-    rtksw_port_duplex_t phy_duplex = RTKSW_PORT_FULL_DUPLEX;
-    bool resolved;
-
-    if (port >= RTL8366UB_NUM_PORTS)
-        return;
-
-    memset(&mac_cfg, 0, sizeof(mac_cfg));
-
-    /*
-     * The user-port copper PHYs are driven by generic C22 phylib, which tops
-     * out at 1000BASE-T: the 2500BASE-T advertisement (OCP 0xA5D4) and
-     * resolution (OCP 0xA434) live in vendor OCP space that C22 genphy never
-     * reads, so @speed caps at 1000 even when the link actually ran at 2.5G.
-     * Read the chip's own resolved speed/duplex and force the switch MAC to
-     * the real rate; only fall back to auto-sync if that read fails (never
-     * force a stale 1000, which would silently cap the port).
-     */
-    mutex_lock(&priv->reg_mutex);
-    resolved = (rtk_port_phyStatus_get(port, &link, &phy_speed,
-                                       &phy_duplex) == RT_ERR_OK) &&
-               (link == RTKSW_PORT_LINKUP);
-
-    if (resolved) {
-        mac_cfg.forcemode = PORT_MAC_FORCE;
-        mac_cfg.speed = phy_speed;
-        mac_cfg.duplex = phy_duplex;
-    } else {
-        mac_cfg.forcemode = PORT_MAC_NORMAL;
-        switch (speed) {
-            case SPEED_10:   mac_cfg.speed = RTKSW_PORT_SPEED_10M; break;
-            case SPEED_100:  mac_cfg.speed = RTKSW_PORT_SPEED_100M; break;
-            case SPEED_2500: mac_cfg.speed = RTKSW_PORT_SPEED_2500M; break;
-            case SPEED_1000:
-            default:         mac_cfg.speed = RTKSW_PORT_SPEED_1000M; break;
-        }
-        mac_cfg.duplex = (duplex == DUPLEX_FULL) ?
-            RTKSW_PORT_FULL_DUPLEX : RTKSW_PORT_HALF_DUPLEX;
-    }
-
-    mac_cfg.link = RTKSW_PORT_LINKUP;
-    mac_cfg.nway = RTKSW_DISABLED;
-    mac_cfg.txpause = tx_pause;
-    mac_cfg.rxpause = rx_pause;
-
-    rtk_port_macForceLink_set(port, &mac_cfg);
-    mutex_unlock(&priv->reg_mutex);
-}
-
 static int rtl8366ub_sw_port_change_mtu(struct dsa_switch *ds, int port,
                                         int new_mtu)
 {
@@ -745,29 +747,116 @@ static int rtl8366ub_sw_port_max_mtu(struct dsa_switch *ds, int port)
            RTL8366UB_CPU_TAG_LEN;
 }
 
+static void rtl8366ub_sw_phylink_get_caps(struct dsa_switch *ds, int port,
+                                          struct phylink_config *config)
+{
+    if (port < RTL8366UB_NUM_PORTS) {
+        __set_bit(PHY_INTERFACE_MODE_INTERNAL,
+                  config->supported_interfaces);
+        __set_bit(PHY_INTERFACE_MODE_GMII,
+                  config->supported_interfaces);
+        config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
+                                   MAC_10 | MAC_100 | MAC_1000FD |
+                                   MAC_2500FD;
+        return;
+    }
+
+    __set_bit(PHY_INTERFACE_MODE_2500BASEX,
+              config->supported_interfaces);
+    __set_bit(PHY_INTERFACE_MODE_USXGMII,
+              config->supported_interfaces);
+    config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
+                               MAC_1000FD | MAC_2500FD | MAC_10000FD;
+}
+
+static void rtl8366ub_sw_phylink_mac_config(struct phylink_config *config,
+        unsigned int mode, const struct phylink_link_state *state)
+{
+}
+
+static void rtl8366ub_sw_phylink_mac_link_down(struct phylink_config *config,
+        unsigned int mode, phy_interface_t interface)
+{
+    struct dsa_port *dp = dsa_phylink_to_port(config);
+    int port = dp->index;
+    rtksw_port_mac_ability_t mac_cfg = { 0 };
+
+    if (port >= RTL8366UB_NUM_PORTS)
+        return;
+
+    mac_cfg.link = RTKSW_PORT_LINKDOWN;
+    rtk_port_macForceLink_set(port, &mac_cfg);
+}
+
+static void rtl8366ub_sw_phylink_mac_link_up(struct phylink_config *config,
+        struct phy_device *phydev, unsigned int mode,
+        phy_interface_t interface, int speed, int duplex,
+        bool tx_pause, bool rx_pause)
+{
+    struct dsa_port *dp = dsa_phylink_to_port(config);
+    int port = dp->index;
+    rtksw_port_mac_ability_t mac_cfg = { 0 };
+
+    if (port >= RTL8366UB_NUM_PORTS)
+        return;
+
+    /* @speed is trustworthy here: rtl8366ub_phy.c implements .read_status via
+     * rtk_port_phyStatus_get(), so 2.5G resolution is reported correctly
+     * rather than being capped at 1000 by generic C22 phylib.
+     */
+    switch (speed) {
+        case SPEED_10:
+            mac_cfg.speed = RTKSW_PORT_SPEED_10M;
+            break;
+        case SPEED_100:
+            mac_cfg.speed = RTKSW_PORT_SPEED_100M;
+            break;
+        case SPEED_1000:
+            mac_cfg.speed = RTKSW_PORT_SPEED_1000M;
+            break;
+        case SPEED_2500:
+            mac_cfg.speed = RTKSW_PORT_SPEED_2500M;
+            break;
+        default:
+            mac_cfg.speed = RTKSW_PORT_SPEED_2500M;
+    }
+    mac_cfg.forcemode = PORT_MAC_NORMAL;
+    mac_cfg.duplex = duplex;
+    mac_cfg.link = RTKSW_PORT_LINKUP;
+    mac_cfg.nway = RTKSW_DISABLED;
+    mac_cfg.txpause = tx_pause;
+    mac_cfg.rxpause = rx_pause;
+
+    rtk_port_macForceLink_set(port, &mac_cfg);
+}
+
+static const struct phylink_mac_ops rtl8366ub_phylink_mac_ops = {
+    .mac_config = rtl8366ub_sw_phylink_mac_config,
+    .mac_link_down = rtl8366ub_sw_phylink_mac_link_down,
+    .mac_link_up = rtl8366ub_sw_phylink_mac_link_up,
+};
+
 /*
  * Concurrency and MDIO-bus locking - verified correct, documented so neither
  * is "fixed" into a regression:
  *
  *   (a) The SDK's global rtksw_api_mutex that serialises every rtk_*() call is
- *       DEFINE_MUTEX(rtksw_api_mutex) at rtk_switch.c:35 (declared extern
- *       struct mutex at rtk_switch.h:46). It is statically initialised - do
- *       NOT add a mutex_init() for it and do NOT try to "cover" it with
- *       priv->reg_mutex. In the kernel build RTK_X86_CLE is undefined, so
- *       RTKSW_API_LOCK expands to mutex_lock(&rtksw_api_mutex) (not pthread):
- *       every rtk_* entry point the driver calls holds it around register
+ *       DEFINE_MUTEX(rtksw_api_mutex) in rtk_switch.c. It is statically
+ *       initialised - do NOT add a mutex_init() for it and do NOT try to
+ *       "cover" it with priv->reg_mutex. In the kernel build RTK_X86_CLE is
+ *       undefined, so RTKSW_API_LOCK expands to mutex_lock(&rtksw_api_mutex)
+ *       (not pthread): every rtk_* entry point holds it around register
  *       access, so all chip access is globally serialised. Lock ordering is
- *       consistent (priv->reg_mutex is always outer, rtksw_api_mutex always
+ *       consistent (priv->reg_mutex always outer, rtksw_api_mutex always
  *       inner) so there is no AB-BA deadlock.
  *
  *   (b) dal/smi.c holds __mii_bus->mdio_lock across the whole indirect
- *       transaction (rtlglue_drvMutexLock -> mutex_lock(&__mii_bus->mdio_lock))
- *       and issues it via the __mdiobus_* (unlocked) accessors - exactly the
- *       in-tree realtek-mdio.c pattern. That is what keeps switch indirect
- *       access atomic vs the WAN c45 PHY at mdio addr 15 on the shared bus.
- *       Do NOT "simplify" smi.c to the self-locking mdiobus_read/write: that
- *       would drop the lock between the address-latch write and the data read
- *       and let the WAN-PHY poll corrupt the indirect access.
+ *       transaction and issues it via the __mdiobus_* (unlocked) accessors -
+ *       exactly the in-tree realtek-mdio.c pattern. That is what keeps switch
+ *       indirect access atomic against the WAN c45 PHY at mdio addr 15 on the
+ *       shared bus. Do NOT "simplify" smi.c to the self-locking
+ *       mdiobus_read/write: that would drop the lock between the address-latch
+ *       write and the data read and let the WAN-PHY poll corrupt it.
  */
 
 /*
@@ -806,10 +895,6 @@ static const struct dsa_switch_ops rtl8366ub_switch_ops = {
     .port_vlan_filtering = rtl8366ub_sw_port_vlan_filtering,
     .port_vlan_add = rtl8366ub_sw_port_vlan_add,
     .port_vlan_del = rtl8366ub_sw_port_vlan_del,
-    .phylink_get_caps = rtl8366ub_sw_phylink_get_caps,
-    .phylink_mac_config = rtl8366ub_sw_phylink_mac_config,
-    .phylink_mac_link_down = rtl8366ub_sw_phylink_mac_link_down,
-    .phylink_mac_link_up = rtl8366ub_sw_phylink_mac_link_up,
     .port_fast_age = rtl8366ub_sw_port_fast_age,
     .port_pre_bridge_flags = rtl8366ub_sw_port_pre_bridge_flags,
     .port_bridge_flags = rtl8366ub_sw_port_bridge_flags,
@@ -817,6 +902,7 @@ static const struct dsa_switch_ops rtl8366ub_switch_ops = {
     .port_fdb_del = rtl8366ub_sw_port_fdb_del,
     .port_change_mtu = rtl8366ub_sw_port_change_mtu,
     .port_max_mtu = rtl8366ub_sw_port_max_mtu,
+    .phylink_get_caps = rtl8366ub_sw_phylink_get_caps,
 };
 
 static int port_isolation_show(struct seq_file *s, void *v)
@@ -837,17 +923,20 @@ static ssize_t phy_reg_read(struct file *file,
                             const char __user *user_buf,
                             size_t count, loff_t *ppos)
 {
+    rtksw_port_phy_data_t val = 0;
     char buf[256] = "";
-    int phy, reg, val;
+    unsigned int phy, reg;
 
     if (copy_from_user(buf, user_buf, min(count, sizeof(buf) - 1)))
         return -EFAULT;
 
-    sscanf(buf, "%d %x\n", &phy, (unsigned int *)&reg);
+    if (sscanf(buf, "%u %x", &phy, &reg) != 2)
+        return -EINVAL;
 
-    rtk_port_phyReg_get(phy, reg, &val);
+    if (rtk_port_phyReg_get(phy, reg, &val) != RT_ERR_OK)
+        return -EIO;
 
-    pr_info("phy: %d, reg: 0x%x = 0x%x\n", phy, reg, val);
+    pr_info("phy: %u, reg: 0x%x = 0x%x\n", phy, reg, val);
 
     return count;
 }
@@ -887,8 +976,7 @@ static int rtl8366ub_mdio_probe(struct mdio_device *mdiodev)
     /*
      * NOTE: the SDK's global rtksw_api_mutex that serialises every rtk_*()
      * call is a DEFINE_MUTEX() in rtk_switch.c (statically initialised) - do
-     * NOT add a mutex_init() for it. There is no uninitialised-mutex/crash
-     * risk here.
+     * NOT add a mutex_init() for it.
      */
     dev_set_drvdata(&mdiodev->dev, priv);
 
@@ -896,18 +984,7 @@ static int rtl8366ub_mdio_probe(struct mdio_device *mdiodev)
     priv->ds->num_ports = EXT_PORT1 + 1;
     priv->ds->priv = priv;
     priv->ds->ops = &rtl8366ub_switch_ops;
-
-    /* User ports 0 and 1 carry the integrated PHYs. Without this mask the
-     * DSA fallback user MII bus sets phy_mask = ~phys_mii_mask = ~0 and scans
-     * no addresses, so lan1/lan2 PHYs never attach and registration aborts.
-     */
-    priv->ds->phys_mii_mask = BIT(UTP_PORT0) | BIT(UTP_PORT1);
-
-    /* Commit bridge VLANs to hardware even while a bridge is not in
-     * vlan_filtering mode, so toggling vlan_filtering later cannot desync the
-     * chip VLAN table from the bridge's view.
-     */
-    priv->ds->configure_vlan_while_not_filtering = true;
+    priv->ds->phylink_mac_ops = &rtl8366ub_phylink_mac_ops;
 
     /* The rtl8_4 tagger sets LEARN_DIS on every CPU-injected frame
      * (tag_rtl8_4.c), so the switch never learns the router/host MAC by
@@ -975,9 +1052,29 @@ static struct mdio_driver rtl8366ub_mdio_driver = {
     .shutdown = rtl8366ub_mdio_shutdown,
 };
 
-mdio_module_driver(rtl8366ub_mdio_driver);
+static int __init rtl8366ub_module_init(void)
+{
+    int ret;
+
+    ret = rtl8366ub_phy_driver_register();
+    if (ret)
+        return ret;
+
+    ret = mdio_driver_register(&rtl8366ub_mdio_driver);
+    if (ret)
+        rtl8366ub_phy_driver_unregister();
+
+    return ret;
+}
+module_init(rtl8366ub_module_init);
+
+static void __exit rtl8366ub_module_exit(void)
+{
+    mdio_driver_unregister(&rtl8366ub_mdio_driver);
+    rtl8366ub_phy_driver_unregister();
+}
+module_exit(rtl8366ub_module_exit);
 
 MODULE_AUTHOR("Jianhui Zhao <jianhui.zhao@gl-inet.com>");
 MODULE_DESCRIPTION("DSA driver for the RTL8371C (RTL8366UB) 2.5G switch");
 MODULE_LICENSE("GPL");
-
