@@ -1,7 +1,4 @@
-
-          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config \
-            || { echo "ERROR: rtl8_4 tagger not selected"; exit 1; }
-          echo "kmod-dsa-tag-rtl8-4: selected"name: Build GL-MT5000 OpenWrt (DSA)
+name: Build GL-MT5000 OpenWrt (DSA)
 
 on:
   workflow_dispatch:
