@@ -85,6 +85,12 @@ and the DSA queue map.
 It builds on OpenWrt's `795-09` (Daniel Golle), which already generalised this
 function for the MaxLinear MxL862xx — the same problem class.
 
+The same substitution also corrects ingress `ppe_index` selection, but that is
+a no-op on this board: MT7987 has `ppe_num = 2` and PPE index follows MAC id,
+so the conduit `gmac0` maps to `ppe_idx 0`, which is already the default
+`mtk_eth_setup_tc_block_cb()` passes. The patch's real effect here is
+unblocking the WAN→LAN egress direction.
+
 **Provenance:** GL acknowledged the offload problem (forum #126), shipped a
 fixed test build via WeTransfer (#130) that a tester confirmed working (#134),
 and said it would be committed "once validation completes" (#135, 2026-08-29).

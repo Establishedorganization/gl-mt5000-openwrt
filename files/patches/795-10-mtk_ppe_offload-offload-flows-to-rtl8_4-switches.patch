@@ -30,9 +30,12 @@ Add a case that substitutes the conduit and then returns -ENODEV, so the
 caller resolves a real GDM pse_port, skips mtk_foe_entry_set_dsa() and the
 DSA queue map, and falls back to queue = pse_port - 1.
 
-This also fixes ingress ppe_index selection for flows coming *from* a
-Realtek user port, since mtk_flow_offload_replace() calls
-mtk_flow_get_dsa_port(&idev, NULL) purely for the conduit substitution.
+mtk_flow_offload_replace() also calls mtk_flow_get_dsa_port(&idev, NULL)
+purely for the conduit substitution, so ingress ppe_index selection becomes
+correct too. Note this changes nothing on MT7987: ppe_num is 2 and PPE index
+follows the MAC id, so the conduit gmac0 maps to ppe_idx 0 - which is already
+the ppe_index default that mtk_eth_setup_tc_block_cb() passes in. It matters
+only where the conduit is not gmac0.
 
 Note for VLAN setups: an untagged injected frame takes the CPU port's PVID.
 Flows egressing a VLAN upper (e.g. br-lan.20) still carry their user VLAN
