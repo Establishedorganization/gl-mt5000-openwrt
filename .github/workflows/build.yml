@@ -13,6 +13,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout build repo
         uses: actions/checkout@v4
@@ -40,36 +41,32 @@ jobs:
           cd "$OPENWRT_PATH"
           echo "HEAD: $(git rev-parse --short HEAD) on $REPO_BRANCH"
 
-      - name: Cache downloads & ccache
+      - name: Cache downloads and ccache
         uses: actions/cache@v4
         with:
           path: |
             /mnt/openwrt/dl
             /mnt/openwrt/.ccache
           key: mt5000-${{ hashFiles('config/mt5000.config', 'scripts/diy.sh', 'files/dsa/rtl8366ub_dsa.c', 'files/patches/795-10-mtk_ppe_offload-offload-flows-to-rtl8_4-switches.patch') }}
-          restore-keys: mt5000-
+          restore-keys: |
+            mt5000-
 
-#      - name: Graft device support + convert switch to DSA
-#        run: |
-#          cd "$OPENWRT_PATH"
-#          bash "$GITHUB_WORKSPACE/scripts/diy.sh"
-
-      - name: Graft device support + convert switch to DSA
+      - name: Graft device support and apply MT5000 fixes
         run: |
-            set -euxo pipefail
-            cd "$OPENWRT_PATH"
+          set -euxo pipefail
+          cd "$OPENWRT_PATH"
 
-            echo "=== OpenWrt HEAD ==="
-            git log -1 --oneline
-            git status --short
+          echo "=== OpenWrt HEAD ==="
+          git log -1 --oneline
+          git status --short
 
-            echo "=== diy.sh ==="
-            sed -n '1,240p' "$GITHUB_WORKSPACE/scripts/diy.sh"
+          echo "=== diy.sh ==="
+          sed -n '1,240p' "$GITHUB_WORKSPACE/scripts/diy.sh"
 
-            echo "=== Running diy.sh ==="
-            bash -x "$GITHUB_WORKSPACE/scripts/diy.sh"
-      
-      - name: Update & install feeds (official only)
+          echo "=== Running diy.sh ==="
+          bash -x "$GITHUB_WORKSPACE/scripts/diy.sh"
+
+      - name: Update and install feeds
         run: |
           cd "$OPENWRT_PATH"
           ./scripts/feeds update -a
@@ -84,31 +81,40 @@ jobs:
       - name: Verify switch driver is selected
         run: |
           cd "$OPENWRT_PATH"
-          grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config \
-            || { echo "ERROR: kmod-rtl8366ub was dropped by defconfig"; exit 1; }
+
+          grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config || {
+            echo "ERROR: kmod-rtl8366ub was dropped by defconfig"
+            exit 1
+          }
           echo "kmod-rtl8366ub: selected"
-          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config \
-            || { echo "ERROR: rtl8_4 DSA tagger not selected"; exit 1; }
+
+          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config || {
+            echo "ERROR: rtl8_4 DSA tagger not selected"
+            exit 1
+          }
           echo "kmod-dsa-tag-rtl8-4: selected"
 
       - name: Download sources
         run: |
           cd "$OPENWRT_PATH"
-          make -j$(nproc) download || make -j1 download
+          make -j"$(nproc)" download || make -j1 download
 
       - name: Compile firmware
         run: |
           cd "$OPENWRT_PATH"
-          make -j$(nproc) || make -j$(nproc) || make -j1 V=s
+          make -j"$(nproc)" || make -j"$(nproc)" || make -j1 V=s
 
       - name: Collect firmware
         if: always()
         run: |
           cd "$OPENWRT_PATH"
           mkdir -p "$GITHUB_WORKSPACE/artifact"
-          find bin/targets -type f \( -name '*sysupgrade.bin' -o -name '*initramfs*.bin' \
+
+          find bin/targets -type f \
+            \( -name '*sysupgrade.bin' -o -name '*initramfs*.bin' \
             -o -name '*.manifest' -o -name 'config.buildinfo' \) \
             -exec cp {} "$GITHUB_WORKSPACE/artifact/" \; || true
+
           cp .config "$GITHUB_WORKSPACE/artifact/resolved.config" || true
           ls -la "$GITHUB_WORKSPACE/artifact/" || true
 
