@@ -77,23 +77,49 @@ jobs:
           cd "$OPENWRT_PATH"
           cp "$GITHUB_WORKSPACE/config/mt5000.config" .config
           make defconfig
-
-      - name: Verify switch driver is selected
+          
+      - name: Verify GL RTL8366UB DSA driver
         run: |
           cd "$OPENWRT_PATH"
 
-          grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config || {
-            echo "ERROR: kmod-rtl8366ub was dropped by defconfig"
-            exit 1
-          }
-          echo "kmod-rtl8366ub: selected"
+          test -f target/linux/generic/pending-6.18/795-10-net-dsa-realtek-add-rtl8366ub.patch \
+            || {
+              echo "ERROR: GL RTL8366UB kernel driver patch is missing"
+              exit 1
+            }
 
-          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config || {
-            echo "ERROR: rtl8_4 DSA tagger not selected"
-            exit 1
-          }
-          echo "kmod-dsa-tag-rtl8-4: selected"
+          grep -q 'CONFIG_NET_DSA_REALTEK_RTL8366UB' \
+            target/linux/mediatek/filogic/config-6.18 \
+            || {
+              echo "ERROR: RTL8366UB kernel driver is not enabled"
+              exit 1
+            }
 
+          grep -q 'DSA_TAG_PROTO_RTL8366UB_8021Q' \
+            target/linux/generic/pending-6.18/795-10-net-dsa-realtek-add-rtl8366ub.patch \
+            || {
+              echo "ERROR: expected RTL8366UB 8021Q tagger is missing"
+              exit 1
+            }
+
+          echo "GL RTL8366UB DSA driver: selected"          
+#
+#      - name: Verify switch driver is selected
+#        run: |
+#          cd "$OPENWRT_PATH"
+#
+#          grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config || {
+#            echo "ERROR: kmod-rtl8366ub was dropped by defconfig"
+#            exit 1
+#          }
+#          echo "kmod-rtl8366ub: selected"
+#
+#          grep -q '^CONFIG_PACKAGE_kmod-dsa-tag-rtl8-4=y' .config || {
+#            echo "ERROR: rtl8_4 DSA tagger not selected"
+#            exit 1
+#          }
+#          echo "kmod-dsa-tag-rtl8-4: selected"
+#
       - name: Download sources
         run: |
           cd "$OPENWRT_PATH"
