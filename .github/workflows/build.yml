@@ -49,11 +49,26 @@ jobs:
           key: mt5000-${{ hashFiles('config/mt5000.config', 'scripts/diy.sh', 'files/dsa/rtl8366ub_dsa.c', 'files/patches/795-10-mtk_ppe_offload-offload-flows-to-rtl8_4-switches.patch') }}
           restore-keys: mt5000-
 
+#      - name: Graft device support + convert switch to DSA
+#        run: |
+#          cd "$OPENWRT_PATH"
+#          bash "$GITHUB_WORKSPACE/scripts/diy.sh"
+
       - name: Graft device support + convert switch to DSA
         run: |
-          cd "$OPENWRT_PATH"
-          bash "$GITHUB_WORKSPACE/scripts/diy.sh"
+            set -euxo pipefail
+            cd "$OPENWRT_PATH"
 
+            echo "=== OpenWrt HEAD ==="
+            git log -1 --oneline
+            git status --short
+
+            echo "=== diy.sh ==="
+            sed -n '1,240p' "$GITHUB_WORKSPACE/scripts/diy.sh"
+
+            echo "=== Running diy.sh ==="
+            bash -x "$GITHUB_WORKSPACE/scripts/diy.sh"
+      
       - name: Update & install feeds (official only)
         run: |
           cd "$OPENWRT_PATH"
