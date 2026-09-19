@@ -38,7 +38,17 @@ echo ">> graft OK"
 
 # --- 2. Our RTL8371C driver on top of GL's -------------------------------
 echo ">> Installing patched rtl8366ub_dsa.c"
-cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
+
+src="$WORKSPACE/files/dsa/rtl8366ub_dsa.c"
+dst="$RTLPKG/src/rtl8366ub_dsa.c"
+
+if [[ ! -f "$src" ]]; then
+    echo "ERROR: missing patched driver source: $src"
+    exit 1
+fi
+
+mkdir -p "$(dirname "$dst")"
+cp "$src" "$dst"
 
 # Our driver keeps a debugfs dir handle in priv; GL's header has no such field.
 if ! grep -q 'struct dentry \*dbgfs;' "$RTLPKG/src/rtl8366ub_dsa.h"; then
